@@ -1,3 +1,5 @@
+importScripts("folder-layout.js");
+
 const DEFAULT_OPTIONS = {
   minWidth: 480,
   minHeight: 480,
@@ -5,8 +7,9 @@ const DEFAULT_OPTIONS = {
   includeBackgrounds: true,
   includeSrcset: true,
   hideDownloadUi: true,
-  saveByDate: true,
-  logEnabled: true
+  folderLayout: DEFAULT_FOLDER_LAYOUT,
+  logEnabled: true,
+  detailedLogEnabled: false
 };
 
 const MIN_IMAGE_DIMENSION = 480;
@@ -20,7 +23,6 @@ const UPDATE_RELEASE_API_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY
 const UPDATE_RELEASES_URL = `https://github.com/${UPDATE_REPOSITORY}/releases`;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPDATE_ALARM_NAME = "checkLatestRelease";
-const OPEN_FOLDER_MARKER_CLEANUP_MS = 30000;
 
 const DEFAULT_RUNTIME = {
   collectorActive: false
@@ -41,12 +43,12 @@ let dailyDownloadsWriteQueue = Promise.resolve();
 let logWriteQueue = Promise.resolve();
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const existing = await chrome.storage.sync.get(Object.keys(DEFAULT_OPTIONS));
+  const existing = await chrome.storage.sync.get([...Object.keys(DEFAULT_OPTIONS), "saveByDate", "saveBySite"]);
   const next = {};
 
   for (const [key, value] of Object.entries(DEFAULT_OPTIONS)) {
     if (existing[key] === undefined) {
-      next[key] = value;
+      next[key] = key === "folderLayout" ? resolveFolderLayout(existing) : value;
     }
   }
 
@@ -115,7 +117,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "sync") {
-    if (changes.includeBackgrounds || changes.includeSrcset) {
+    if (changes.includeBackgrounds || changes.includeSrcset || changes.folderLayout || changes.detailedLogEnabled) {
       syncActiveTabCollection();
     }
   }
@@ -130,12 +132,16 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "SCAN_SUMMARY") {
-    addLog("info", "페이지 스캔 완료", {
+    const details = {
       pageUrl: sender.tab?.url || "",
       images: toNonNegativeNumber(message.images),
       srcset: toNonNegativeNumber(message.srcset),
       backgrounds: toNonNegativeNumber(message.backgrounds)
-    });
+    };
+    if (message.diagnostics) {
+      details.diagnostics = message.diagnostics;
+    }
+    addLog("info", "페이지 스캔 완료", details);
     sendResponse({ ok: true });
     return false;
   }
@@ -188,13 +194,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "OPEN_DOWNLOAD_FOLDER") {
     openDownloadFolder()
       .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
-    return true;
-  }
-
-  if (message?.type === "CLEANUP_OPEN_FOLDER_MARKER") {
-    cleanupOpenFolderMarker(message.downloadId)
-      .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
@@ -466,6 +465,11 @@ async function isLogEnabled() {
   return stored.logEnabled !== false;
 }
 
+async function isDetailedLogEnabled() {
+  const stored = await chrome.storage.sync.get({ detailedLogEnabled: DEFAULT_OPTIONS.detailedLogEnabled });
+  return stored.detailedLogEnabled === true;
+}
+
 function scheduleUpdateCheck() {
   chrome.alarms.create(UPDATE_ALARM_NAME, {
     periodInMinutes: UPDATE_CHECK_INTERVAL_MS / 60000
@@ -586,6 +590,42 @@ function countCandidateSources(candidates) {
   }, {});
 }
 
+function recordSkippedSample(samples, reason, candidate) {
+  if (samples.length >= 8) {
+    return;
+  }
+
+  samples.push({
+    reason,
+    ...createCandidateLogSample(candidate)
+  });
+}
+
+function createCandidateLogSample(candidate) {
+  return {
+    url: shortenUrl(candidate?.url || ""),
+    width: toNonNegativeNumber(candidate?.width),
+    height: toNonNegativeNumber(candidate?.height),
+    source: candidate?.source || "unknown"
+  };
+}
+
+function createOptionLogSample(options) {
+  return {
+    minWidth: options.minWidth,
+    minHeight: options.minHeight,
+    includeBackgrounds: options.includeBackgrounds,
+    includeSrcset: options.includeSrcset,
+    hideDownloadUi: options.hideDownloadUi,
+    folderLayout: options.folderLayout
+  };
+}
+
+function shortenUrl(url) {
+  const text = String(url || "");
+  return text.length > 220 ? `${text.slice(0, 217)}...` : text;
+}
+
 function createEmptyDailyDownloads() {
   return {
     date: getTodayKey(),
@@ -635,14 +675,25 @@ async function handleContentReady(tabId, pageUrl) {
   }
 
   const pausedReason = getPausedHostReason(getUrlHost(pageUrl));
-  state.active = collectorActive && isWebUrl(pageUrl) && !pausedReason && await isFocusedActiveTab(tabId);
+  const webUrl = isWebUrl(pageUrl);
+  const focusedActiveTab = await isFocusedActiveTab(tabId);
+  state.active = collectorActive && webUrl && !pausedReason && focusedActiveTab;
   state.stopReason = pausedReason;
   await updateBadge(tabId);
-  addLog("info", "콘텐츠 준비", {
+  const details = {
     pageUrl,
     active: state.active,
     stopReason: state.stopReason || ""
-  });
+  };
+  if (await isDetailedLogEnabled()) {
+    details.checks = {
+      collectorActive,
+      webUrl,
+      focusedActiveTab,
+      paused: Boolean(pausedReason)
+    };
+  }
+  addLog("info", "콘텐츠 준비", details);
 
   return {
     active: state.active,
@@ -651,12 +702,21 @@ async function handleContentReady(tabId, pageUrl) {
 }
 
 async function handleImageCandidates(tabId, candidates, pageUrl) {
-  if (tabId === undefined || !(await isCollectorActive()) || !(await isFocusedActiveTab(tabId))) {
-    addLog("info", "후보 무시", {
+  const collectorActive = await isCollectorActive();
+  const focusedActiveTab = tabId !== undefined ? await isFocusedActiveTab(tabId) : false;
+  if (tabId === undefined || !collectorActive || !focusedActiveTab) {
+    const details = {
       pageUrl,
       count: candidates.length,
       reason: tabId === undefined ? "탭 ID 없음" : "수집 꺼짐 또는 비활성 탭"
-    });
+    };
+    if (await isDetailedLogEnabled()) {
+      details.checks = {
+        collectorActive,
+        focusedActiveTab
+      };
+    }
+    addLog("info", "후보 무시", details);
     if (tabId !== undefined) {
       const state = getState(tabId);
       state.active = false;
@@ -707,31 +767,48 @@ async function enqueueCandidates(tabId, candidates, pageUrl) {
     pausedHost: 0,
     downloadedToday: 0
   };
+  const detailedLogEnabled = await isDetailedLogEnabled();
+  const skippedSamples = [];
   for (const candidate of candidates) {
     const normalized = normalizeCandidate(candidate, pageUrl);
     const key = normalized ? getCandidateKey(normalized) : "";
     if (!normalized) {
       skipped.invalid += 1;
+      if (detailedLogEnabled) {
+        recordSkippedSample(skippedSamples, "invalid", candidate);
+      }
       continue;
     }
 
     if (state.seen.has(key)) {
       skipped.duplicateInPage += 1;
+      if (detailedLogEnabled) {
+        recordSkippedSample(skippedSamples, "duplicateInPage", normalized);
+      }
       continue;
     }
 
     if (isUndersizedCandidate(normalized)) {
       skipped.undersized += 1;
+      if (detailedLogEnabled) {
+        recordSkippedSample(skippedSamples, "undersized", normalized);
+      }
       continue;
     }
 
     if (isHostPaused(getCandidateHost(normalized))) {
       skipped.pausedHost += 1;
+      if (detailedLogEnabled) {
+        recordSkippedSample(skippedSamples, "pausedHost", normalized);
+      }
       continue;
     }
 
     if (dailyDownloads.urls[normalized.url]) {
       skipped.downloadedToday += 1;
+      if (detailedLogEnabled) {
+        recordSkippedSample(skippedSamples, "downloadedToday", normalized);
+      }
       continue;
     }
 
@@ -744,13 +821,18 @@ async function enqueueCandidates(tabId, candidates, pageUrl) {
     await addDailyStat("seen", seenAdded);
   }
 
-  addLog(seenAdded > 0 ? "info" : "warn", "후보 큐 반영", {
+  const details = {
     pageUrl,
     received: candidates.length,
     queued: seenAdded,
     queueTotal: state.queue.length,
     skipped
-  });
+  };
+  if (detailedLogEnabled) {
+    details.skippedSamples = skippedSamples;
+    details.queuedSamples = state.queue.slice(0, 5).map(createCandidateLogSample);
+  }
+  addLog(seenAdded > 0 ? "info" : "warn", "후보 큐 반영", details);
 
   runQueue(tabId);
 }
@@ -765,6 +847,13 @@ async function runQueue(tabId) {
   try {
     while (state.active && state.queue.length > 0) {
       if (!(await isCollectorActive())) {
+        if (await isDetailedLogEnabled()) {
+          addLog("info", "큐 처리 중단", {
+            tabId,
+            reason: "수집 꺼짐",
+            remaining: state.queue.length
+          });
+        }
         state.active = false;
         state.queue = [];
         state.queued = 0;
@@ -772,6 +861,13 @@ async function runQueue(tabId) {
       }
 
       if (!(await isFocusedActiveTab(tabId))) {
+        if (await isDetailedLogEnabled()) {
+          addLog("info", "큐 처리 중단", {
+            tabId,
+            reason: "비활성 탭",
+            remaining: state.queue.length
+          });
+        }
         state.active = false;
         state.queue = [];
         state.queued = 0;
@@ -791,17 +887,22 @@ async function runQueue(tabId) {
 
       try {
         const options = await getOptions();
-        const result = await collectCandidate(candidate, options);
+        const result = await collectCandidate(candidate, options, state.pageUrl);
         if (result === "downloaded") {
           await addDailyStat("downloaded");
           state.stopReason = "";
           resetFailureState(state);
         } else {
           await addDailyStat("skipped");
-          addLog("info", "이미지 스킵", {
+          const details = {
             url: candidate.url,
             reason: result
-          });
+          };
+          if (options.detailedLogEnabled) {
+            details.candidate = createCandidateLogSample(candidate);
+            details.options = createOptionLogSample(options);
+          }
+          addLog("info", "이미지 스킵", details);
         }
       } catch (error) {
         console.warn("Jjal Collector failed:", candidate.url, error);
@@ -838,6 +939,16 @@ async function shouldStopAfterFailure(tabId, candidate, error) {
     state.failureStreak = 1;
   }
 
+  if (await isDetailedLogEnabled()) {
+    addLog("warn", "다운로드 실패 누적", {
+      host,
+      streak: state.failureStreak,
+      limit: CONSECUTIVE_FAILURE_LIMIT,
+      url: candidate.url,
+      error: error?.message || String(error)
+    });
+  }
+
   if (state.failureStreak < CONSECUTIVE_FAILURE_LIMIT) {
     return false;
   }
@@ -854,7 +965,7 @@ function resetFailureState(state) {
 }
 
 async function getOptions() {
-  const stored = await chrome.storage.sync.get(DEFAULT_OPTIONS);
+  const stored = await readCollectorOptions(DEFAULT_OPTIONS);
   return {
     minWidth: toMinimumDimension(stored.minWidth),
     minHeight: toMinimumDimension(stored.minHeight),
@@ -862,8 +973,9 @@ async function getOptions() {
     includeBackgrounds: stored.includeBackgrounds !== false,
     includeSrcset: stored.includeSrcset !== false,
     hideDownloadUi: stored.hideDownloadUi !== false,
-    saveByDate: stored.saveByDate !== false,
-    logEnabled: stored.logEnabled !== false
+    folderLayout: stored.folderLayout,
+    logEnabled: stored.logEnabled !== false,
+    detailedLogEnabled: stored.detailedLogEnabled === true
   };
 }
 
@@ -951,7 +1063,7 @@ async function sendCollectorStateToTab(tab, active, scanOptions) {
   }
 }
 
-async function collectCandidate(candidate, options) {
+async function collectCandidate(candidate, options, pageUrl = "") {
   if (candidate.source === "background" && !options.includeBackgrounds) {
     return "background-disabled";
   }
@@ -973,10 +1085,16 @@ async function collectCandidate(candidate, options) {
     return "downloaded-today";
   }
 
-  const filename = buildFilename(options.folder, originalName, options.saveByDate);
+  const pathCandidate = {
+    ...candidate,
+    pageUrl: candidate.pageUrl || pageUrl
+  };
+  const filename = buildFilename(options.folder, originalName, options, pathCandidate);
   addLog("info", "다운로드 시작", {
     url: candidate.url,
+    pageUrl: pathCandidate.pageUrl,
     filename,
+    folderLayout: options.folderLayout,
     width: candidate.width,
     height: candidate.height,
     source: candidate.source
@@ -987,7 +1105,7 @@ async function collectCandidate(candidate, options) {
     conflictAction: "uniquify",
     saveAs: false
   }, options);
-  await addDailyDownload(originalName, filename, candidate.pageUrl || candidate.url, candidate.url, options);
+  await addDailyDownload(originalName, filename, pathCandidate.pageUrl || candidate.url, candidate.url, options);
   addLog("info", "다운로드 완료", {
     url: candidate.url,
     filename
@@ -1002,6 +1120,9 @@ async function downloadCollectorFile(downloadOptions, options) {
 
   try {
     const downloadId = await chrome.downloads.download(downloadOptions);
+    if (!Number.isInteger(downloadId) || downloadId <= 0) {
+      throw new Error(`Invalid download id: ${downloadId}`);
+    }
     await waitForDownloadComplete(downloadId);
     await eraseCollectorDownloadHistory(downloadId, options);
     return downloadId;
@@ -1115,52 +1236,13 @@ async function setChromeDownloadUiVisible(enabled) {
 }
 
 async function openDownloadFolder() {
-  const options = await getOptions();
-  const folder = buildDownloadFolder(options.folder, options.saveByDate);
-  const filename = `${folder}/jjal-collector-open-folder.txt`;
-  let downloadId = null;
-
-  try {
-    downloadId = await chrome.downloads.download({
-      url: "data:text/plain;charset=utf-8,Jjal%20Collector",
-      filename,
-      conflictAction: "overwrite",
-      saveAs: false
-    });
-    if (!Number.isInteger(downloadId) || downloadId <= 0) {
-      throw new Error("Could not create download folder marker");
-    }
-    await waitForDownloadComplete(downloadId);
-    setTimeout(() => {
-      cleanupOpenFolderMarker(downloadId);
-    }, OPEN_FOLDER_MARKER_CLEANUP_MS);
-    addLog("info", "다운로드 폴더 열기 준비", { folder, downloadId });
-    return { folder, downloadId };
-  } catch (error) {
-    if (downloadId !== null) {
-      cleanupOpenFolderMarker(downloadId);
-    }
-    throw error;
-  }
-}
-
-async function cleanupOpenFolderMarker(downloadId) {
-  const id = Number(downloadId);
-  if (!Number.isInteger(id) || id <= 0) {
-    throw new Error("Invalid download marker id");
+  if (!chrome.downloads?.showDefaultFolder) {
+    throw new Error("Downloads folder API is not available");
   }
 
-  try {
-    await chrome.downloads.removeFile(id);
-  } catch (_) {
-    // The file may already be gone or unavailable while the folder is opening.
-  }
-
-  try {
-    await chrome.downloads.erase({ id });
-  } catch (_) {
-    // Best-effort cleanup only.
-  }
+  chrome.downloads.showDefaultFolder();
+  addLog("info", "기본 다운로드 폴더 열기");
+  return { location: "default-downloads", shown: true };
 }
 
 function normalizeCandidate(candidate, pageUrl = "") {
@@ -1247,13 +1329,28 @@ function getOriginalFilename(url) {
   return finalName;
 }
 
-function buildFilename(folder, originalName, saveByDate) {
-  const dateFolder = saveByDate ? `${getTodayFolderName()}/` : "";
-  return `${folder}/${dateFolder}${Date.now()}-${originalName}`;
+function buildFilename(folder, originalName, options, candidate) {
+  const subfolderPath = getDownloadSubfolders(options, candidate).join("/");
+  const prefix = subfolderPath ? `${subfolderPath}/` : "";
+  return `${folder}/${prefix}${Date.now()}-${originalName}`;
 }
 
-function buildDownloadFolder(folder, saveByDate) {
-  return saveByDate ? `${folder}/${getTodayFolderName()}` : folder;
+function getDownloadSubfolders(options, candidate) {
+  switch (options.folderLayout) {
+    case "flat":
+      return [];
+    case "site":
+      return [getSiteFolderName(candidate)];
+    case "site-date":
+      return [getSiteFolderName(candidate), getTodayFolderName()];
+    default:
+      return [getTodayFolderName(), getSiteFolderName(candidate)];
+  }
+}
+
+function getSiteFolderName(candidate) {
+  const host = getUrlHost(candidate?.pageUrl) || getCandidateHost(candidate);
+  return sanitizeFolderSegment(host) || "unknown-site";
 }
 
 function getTodayFolderName() {
@@ -1268,6 +1365,16 @@ function sanitizeFolder(folder) {
     .replace(/[<>:"|?*]+/g, "-");
 
   return clean || DEFAULT_OPTIONS.folder;
+}
+
+function sanitizeFolderSegment(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\\/g, "-")
+    .replace(/\//g, "-")
+    .replace(/^[-. ]+|[-. ]+$/g, "")
+    .replace(/[<>:"|?*\x00-\x1f]+/g, "-")
+    .slice(0, 120);
 }
 
 function toNonNegativeNumber(value) {
@@ -1441,7 +1548,8 @@ function setPixel(data, size, x, y, color) {
 function getContentScanOptions(options) {
   return {
     includeBackgrounds: options.includeBackgrounds,
-    includeSrcset: options.includeSrcset
+    includeSrcset: options.includeSrcset,
+    detailedLogEnabled: options.detailedLogEnabled
   };
 }
 

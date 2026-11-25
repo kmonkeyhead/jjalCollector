@@ -5,23 +5,24 @@ const DEFAULTS = {
   includeBackgrounds: true,
   includeSrcset: true,
   hideDownloadUi: true,
-  saveByDate: true,
-  logEnabled: true
+  folderLayout: DEFAULT_FOLDER_LAYOUT,
+  logEnabled: true,
+  detailedLogEnabled: false
 };
 const MIN_IMAGE_DIMENSION = 480;
 const LOG_KEY = "collectorLogs";
 const DAILY_DOWNLOADS_KEY = "dailyDownloads";
-const OPEN_FOLDER_MARKER_CLEANUP_MS = 30000;
 
 const form = document.getElementById("optionsForm");
 const minWidth = document.getElementById("minWidth");
 const minHeight = document.getElementById("minHeight");
 const folder = document.getElementById("folder");
-const saveByDate = document.getElementById("saveByDate");
+const folderLayout = document.getElementById("folderLayout");
 const hideDownloadUi = document.getElementById("hideDownloadUi");
 const includeSrcset = document.getElementById("includeSrcset");
 const includeBackgrounds = document.getElementById("includeBackgrounds");
 const logEnabled = document.getElementById("logEnabled");
+const detailedLogEnabled = document.getElementById("detailedLogEnabled");
 const saveStatus = document.getElementById("saveStatus");
 const logList = document.getElementById("logList");
 const refreshLogs = document.getElementById("refreshLogs");
@@ -34,7 +35,7 @@ const clearDownloadList = document.getElementById("clearDownloadList");
 
 document.addEventListener("DOMContentLoaded", loadOptions);
 form.addEventListener("submit", saveOptions);
-saveByDate.addEventListener("change", saveOptions);
+folderLayout.addEventListener("change", saveOptions);
 refreshLogs.addEventListener("click", loadLogs);
 clearLogs.addEventListener("click", clearCollectorLogs);
 openDownloadFolder.addEventListener("click", openCollectorDownloadFolder);
@@ -62,46 +63,13 @@ async function openCollectorDownloadFolder() {
     if (!response?.ok) {
       throw new Error(response?.error || "Could not open download folder");
     }
-    showDownloadFolderItem(response.downloadId);
-    scheduleOpenFolderMarkerCleanup(response.downloadId);
-    showStatus("다운로드 폴더를 열었습니다.");
+    showStatus("기본 다운로드 폴더를 열었습니다.");
   } catch (error) {
     showStatus("다운로드 폴더를 열 수 없습니다.");
     console.warn("Jjal Collector could not open download folder:", error);
   } finally {
     openDownloadFolder.disabled = false;
   }
-}
-
-function showDownloadFolderItem(downloadId) {
-  const id = Number(downloadId);
-  if (Number.isInteger(id) && id > 0 && chrome.downloads?.show) {
-    chrome.downloads.show(id);
-    return;
-  }
-
-  if (chrome.downloads?.showDefaultFolder) {
-    chrome.downloads.showDefaultFolder();
-    return;
-  }
-
-  throw new Error("Downloads folder API is not available");
-}
-
-function scheduleOpenFolderMarkerCleanup(downloadId) {
-  const id = Number(downloadId);
-  if (!Number.isInteger(id) || id <= 0) {
-    return;
-  }
-
-  setTimeout(() => {
-    chrome.runtime.sendMessage({
-      type: "CLEANUP_OPEN_FOLDER_MARKER",
-      downloadId: id
-    }).catch(() => {
-      // The background worker may have already cleaned up the marker.
-    });
-  }, OPEN_FOLDER_MARKER_CLEANUP_MS);
 }
 
 async function clearDailyDownloadList() {
@@ -136,32 +104,34 @@ async function clearDailyDownloadList() {
 }
 
 async function loadOptions() {
-  const options = await chrome.storage.sync.get(DEFAULTS);
+  const options = await readCollectorOptions(DEFAULTS);
 
   appVersion.textContent = chrome.runtime.getManifest().version;
   minWidth.value = toMinimumDimension(options.minWidth);
   minHeight.value = toMinimumDimension(options.minHeight);
   folder.value = options.folder || DEFAULTS.folder;
-  saveByDate.checked = options.saveByDate !== false;
+  folderLayout.value = options.folderLayout;
   hideDownloadUi.checked = options.hideDownloadUi !== false;
   includeSrcset.checked = options.includeSrcset !== false;
   includeBackgrounds.checked = options.includeBackgrounds !== false;
   logEnabled.checked = options.logEnabled !== false;
+  detailedLogEnabled.checked = options.detailedLogEnabled === true;
   await loadLogs();
 }
 
 async function saveOptions(event) {
-  event.preventDefault();
+  event?.preventDefault();
 
   await chrome.storage.sync.set({
     minWidth: toMinimumDimension(minWidth.value),
     minHeight: toMinimumDimension(minHeight.value),
     folder: sanitizeFolder(folder.value),
-    saveByDate: saveByDate.checked,
+    folderLayout: folderLayout.value,
     hideDownloadUi: hideDownloadUi.checked,
     includeSrcset: includeSrcset.checked,
     includeBackgrounds: includeBackgrounds.checked,
-    logEnabled: logEnabled.checked
+    logEnabled: logEnabled.checked,
+    detailedLogEnabled: detailedLogEnabled.checked
   });
 
   saveStatus.textContent = "저장됨";

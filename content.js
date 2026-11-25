@@ -4,7 +4,8 @@ let scanTimer = null;
 let scanInProgress = false;
 let scanOptions = {
   includeBackgrounds: true,
-  includeSrcset: true
+  includeSrcset: true,
+  detailedLogEnabled: false
 };
 const MIN_INITIAL_DELAY_MS = 500;
 const MAX_INITIAL_DELAY_MS = 1000;
@@ -113,25 +114,51 @@ async function scanPage() {
     const imageCandidates = [];
     const srcsetCandidates = [];
     const backgroundCandidates = [];
+    const detailedLogEnabled = scanOptions.detailedLogEnabled === true;
+    const diagnostics = detailedLogEnabled ? {
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        visibilityState: document.visibilityState
+      }
+    } : null;
 
-    collectImageElements(imageCandidates);
+    const imageDiagnostics = collectImageElements(imageCandidates, detailedLogEnabled);
+    if (diagnostics) {
+      diagnostics.images = imageDiagnostics;
+    }
     sendCandidates(imageCandidates);
 
     if (scanOptions.includeSrcset) {
-      await collectPictureSources(srcsetCandidates);
+      const srcsetDiagnostics = await collectPictureSources(srcsetCandidates, detailedLogEnabled);
+      if (diagnostics) {
+        diagnostics.srcset = srcsetDiagnostics;
+      }
       sendCandidates(srcsetCandidates);
+    } else if (diagnostics) {
+      diagnostics.srcset = { disabled: true };
     }
 
     if (scanOptions.includeBackgrounds) {
-      await collectBackgroundImages(backgroundCandidates);
+      const backgroundDiagnostics = await collectBackgroundImages(backgroundCandidates, detailedLogEnabled);
+      if (diagnostics) {
+        diagnostics.backgrounds = backgroundDiagnostics;
+      }
       sendCandidates(backgroundCandidates);
+    } else if (diagnostics) {
+      diagnostics.backgrounds = { disabled: true };
     }
 
-    sendScanSummary({
+    const summary = {
       images: imageCandidates.length,
       srcset: srcsetCandidates.length,
       backgrounds: backgroundCandidates.length
-    });
+    };
+    if (diagnostics) {
+      summary.diagnostics = diagnostics;
+    }
+    sendScanSummary(summary);
   } finally {
     scanInProgress = false;
   }
@@ -159,58 +186,124 @@ function sendCandidates(candidates) {
   });
 }
 
-function collectImageElements(candidates) {
+function collectImageElements(candidates, detailedLogEnabled) {
+  const stats = detailedLogEnabled ? {
+    scanned: 0,
+    invisible: 0,
+    invalidUrl: 0,
+    zeroDimension: 0,
+    candidates: 0,
+    samples: []
+  } : null;
+
   for (const image of document.images) {
+    if (stats) {
+      stats.scanned += 1;
+    }
     if (!isVisibleInViewport(image)) {
+      if (stats) {
+        stats.invisible += 1;
+      }
       continue;
     }
 
     const url = image.currentSrc || image.src;
-    pushCandidate(candidates, url, image.naturalWidth, image.naturalHeight, "image");
+    const result = pushCandidate(candidates, url, image.naturalWidth, image.naturalHeight, "image");
+    recordPushResult(stats, result, {
+      url,
+      width: image.naturalWidth,
+      height: image.naturalHeight
+    });
   }
+
+  return stats;
 }
 
-async function collectPictureSources(candidates) {
+async function collectPictureSources(candidates, detailedLogEnabled) {
   const sourceElements = document.querySelectorAll("source[srcset], img[srcset]");
   const visibleSources = new Map();
+  const stats = detailedLogEnabled ? {
+    scanned: sourceElements.length,
+    invisible: 0,
+    unmatchedCurrentSrc: 0,
+    invalidUrl: 0,
+    zeroDimension: 0,
+    candidates: 0,
+    samples: []
+  } : null;
 
   for (const element of sourceElements) {
     const visibleElement = getVisibleSrcsetElement(element);
     if (!visibleElement) {
+      if (stats) {
+        stats.invisible += 1;
+      }
       continue;
     }
 
     const currentUrl = visibleElement.currentSrc || visibleElement.src;
+    let matchedCurrentSrc = false;
     for (const item of parseSrcset(element.getAttribute("srcset"))) {
       const url = toAbsoluteUrl(item);
       if (url && toAbsoluteUrl(currentUrl) === url) {
+        matchedCurrentSrc = true;
         visibleSources.set(url, {
           width: visibleElement.naturalWidth,
           height: visibleElement.naturalHeight
         });
       }
     }
+
+    if (stats && !matchedCurrentSrc) {
+      stats.unmatchedCurrentSrc += 1;
+    }
   }
 
   for (const [url, dimensions] of Array.from(visibleSources).slice(0, MAX_SRCSET_SAMPLES)) {
-    pushCandidate(candidates, url, dimensions.width, dimensions.height, "srcset");
+    const result = pushCandidate(candidates, url, dimensions.width, dimensions.height, "srcset");
+    recordPushResult(stats, result, {
+      url,
+      width: dimensions.width,
+      height: dimensions.height
+    });
   }
+
+  return stats;
 }
 
-async function collectBackgroundImages(candidates) {
+async function collectBackgroundImages(candidates, detailedLogEnabled) {
   const elements = Array.from(document.querySelectorAll("*"));
   const urls = new Set();
+  const stats = detailedLogEnabled ? {
+    scanned: elements.length,
+    invisible: 0,
+    elementsWithBackground: 0,
+    uniqueUrls: 0,
+    dimensionLoadFailed: 0,
+    invalidUrl: 0,
+    zeroDimension: 0,
+    candidates: 0,
+    samples: []
+  } : null;
 
   for (let index = 0; index < elements.length && collectorActive; index += BACKGROUND_ELEMENT_BATCH_SIZE) {
     const batch = elements.slice(index, index + BACKGROUND_ELEMENT_BATCH_SIZE);
 
     for (const element of batch) {
       if (!isVisibleInViewport(element)) {
+        if (stats) {
+          stats.invisible += 1;
+        }
         continue;
       }
 
       const background = getComputedStyle(element).backgroundImage;
-      for (const url of extractCssUrls(background)) {
+      const extractedUrls = extractCssUrls(background);
+      if (stats && extractedUrls.length > 0) {
+        stats.elementsWithBackground += 1;
+      }
+
+      for (const url of extractedUrls) {
         urls.add(url);
       }
     }
@@ -221,13 +314,21 @@ async function collectBackgroundImages(candidates) {
   }
 
   const samples = Array.from(urls).slice(0, MAX_BACKGROUND_SAMPLES);
+  if (stats) {
+    stats.uniqueUrls = urls.size;
+  }
   const dimensions = await loadDimensionsInBatches(samples);
 
   dimensions.forEach((result) => {
     if (result) {
-      pushCandidate(candidates, result.url, result.width, result.height, "background");
+      const pushResult = pushCandidate(candidates, result.url, result.width, result.height, "background");
+      recordPushResult(stats, pushResult, result);
+    } else if (stats) {
+      stats.dimensionLoadFailed += 1;
     }
   });
+
+  return stats;
 }
 
 function getVisibleSrcsetElement(element) {
@@ -292,7 +393,7 @@ function hasInvisibleAncestor(element) {
 function pushCandidate(candidates, rawUrl, width, height, source) {
   const url = toAbsoluteUrl(rawUrl);
   if (!url) {
-    return;
+    return "invalidUrl";
   }
 
   candidates.push({
@@ -301,6 +402,36 @@ function pushCandidate(candidates, rawUrl, width, height, source) {
     height: Number(height) || 0,
     source
   });
+
+  return Number(width) > 0 && Number(height) > 0 ? "candidate" : "zeroDimension";
+}
+
+function recordPushResult(stats, result, sample) {
+  if (!stats) {
+    return;
+  }
+
+  if (result === "candidate") {
+    stats.candidates += 1;
+  } else if (stats[result] !== undefined) {
+    stats[result] += 1;
+  }
+
+  if (stats.samples.length >= 5 || !sample?.url) {
+    return;
+  }
+
+  stats.samples.push({
+    url: shortenUrl(sample.url),
+    width: Number(sample.width) || 0,
+    height: Number(sample.height) || 0,
+    result
+  });
+}
+
+function shortenUrl(url) {
+  const text = String(url || "");
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
 }
 
 function toAbsoluteUrl(rawUrl) {
@@ -444,7 +575,8 @@ function updateScanOptions(nextOptions) {
 
   scanOptions = {
     includeBackgrounds: nextOptions.includeBackgrounds !== false,
-    includeSrcset: nextOptions.includeSrcset !== false
+    includeSrcset: nextOptions.includeSrcset !== false,
+    detailedLogEnabled: nextOptions.detailedLogEnabled === true
   };
 }
 
